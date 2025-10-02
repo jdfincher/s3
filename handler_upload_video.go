@@ -8,7 +8,6 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -17,9 +16,8 @@ import (
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	const maxMemory = 1 << 30
-	vData := http.MaxBytesReader(w, r.Body, maxMemory)
-	r.Body = vData
-	defer vData.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxMemory)
+	defer r.Body.Close()
 
 	videoIDString := r.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDString)
@@ -47,6 +45,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusBadRequest, "Couldn't parse file", err)
 		return
 	}
+	defer file.Close()
 
 	mediaType, _, err := mime.ParseMediaType(head.Header.Get("Content-Type"))
 	if err != nil {
@@ -60,12 +59,13 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	temp, err := os.CreateTemp("", "tubely_video_upload.mp4")
-	defer os.Remove("tubely_video_upload.mp4")
-	defer temp.Close()
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error creating file for video upload", err)
 		return
 	}
+
+	defer os.Remove(temp.Name())
+	defer temp.Close()
 
 	_, err = io.Copy(temp, file)
 	if err != nil {
@@ -73,21 +73,38 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_, err = temp.Seek(0, io.SeekStart)
+	processedPath, err := processVideoForFastStart(temp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Error setting moov atom position", err)
+	}
+
+	aspectRatio, err := getVideoAspectRatio(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to verify aspect ratio", err)
+	}
+
+	fStartVideo, err := os.Open(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not find fast start video", err)
+	}
+	defer os.Remove(fStartVideo.Name())
+	defer fStartVideo.Close()
+
+	_, err = fStartVideo.Seek(0, io.SeekStart)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error setting Seek Start", err)
 		return
 	}
 
-	fileExtension := strings.Replace(mediaType, "video/", ".", 1)
-	key := make([]byte, 32)
+	fileExtension := ".mp4"
+	key := make([]byte, 64)
 	rand.Read(key)
-	fileName := base64.RawURLEncoding.EncodeToString(key) + fileExtension
+	fileName := aspectRatio + base64.RawURLEncoding.EncodeToString(key) + fileExtension
 
 	putObject := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &fileName,
-		Body:        temp,
+		Body:        fStartVideo,
 		ContentType: &mediaType,
 	}
 
@@ -97,21 +114,24 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoMeta, err := cfg.db.GetVideo(videoID)
+	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
 		respondWithError(w, http.StatusNotFound, "Video id not found in database", err)
 		return
 	}
 
-	if videoMeta.UserID != userID {
+	if video.UserID != userID {
 		respondWithError(w, http.StatusUnauthorized, "Unathorized access denied", err)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileName)
-	videoMeta.VideoURL = &videoURL
-	err = cfg.db.UpdateVideo(videoMeta)
+	videoURL := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, fileName)
+	video.VideoURL = &videoURL
+
+	err = cfg.db.UpdateVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error updating video metadata in database", err)
+		return
 	}
+	respondWithJSON(w, http.StatusCreated, video)
 }
